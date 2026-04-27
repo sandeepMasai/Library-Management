@@ -5,12 +5,14 @@ const { connectToMongo } = require("./src/config/db");
 const app = require("./src/app");
 
 const PORT = Number(process.env.PORT) || 5001;
+const HOST = process.env.HOST || "0.0.0.0";
 
 async function start() {
   await connectToMongo();
 
-  const server = app.listen(PORT, () => {
-    console.log(`Backend running on http://localhost:${PORT}`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`Backend running on http://${HOST}:${PORT}`);
+    console.log("If testing from phone, use your Mac LAN IP (e.g. http://10.x.x.x:" + PORT + ")");
   });
 
   server.on("error", (err) => {

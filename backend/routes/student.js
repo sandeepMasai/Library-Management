@@ -1,6 +1,7 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const Student = require("../models/Student");
+const Library = require("../models/Library");
 const Attendance = require("../models/Attendance");
 const Notification = require("../models/Notification");
 const Seat = require("../models/Seat");
@@ -18,11 +19,18 @@ function toDateKey(date = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
-function toStudentResponse(student) {
+function toStudentResponse(student, library) {
   return {
     id: student._id.toString(),
     role: "student",
     libraryId: student.libraryId?.toString?.() || null,
+    library: library
+      ? {
+          id: library._id?.toString?.() || null,
+          libraryName: library.name || "",
+          logoUrl: library.logoUrl || null,
+        }
+      : null,
     name: student.name,
     mobile: student.mobile,
     username: student.username,
@@ -71,7 +79,8 @@ router.get("/me", requireAuth, requireRole("student"), async (req, res) => {
     const todayKey = toDateKey(new Date());
     const ym = todayKey.slice(0, 7); // YYYY-MM
 
-    const [todayAttendance, monthAttendanceCount, recentNotifications, seat] = await Promise.all([
+    const [library, todayAttendance, monthAttendanceCount, recentNotifications, seat] = await Promise.all([
+      Library.findById(libraryId).select("name logoUrl").lean(),
       Attendance.findOne({ libraryId, studentId: userId, attendanceDate: todayKey }).lean(),
       Attendance.countDocuments({
         libraryId,
@@ -94,7 +103,7 @@ router.get("/me", requireAuth, requireRole("student"), async (req, res) => {
 
     return res.json({
       ok: true,
-      student: toStudentResponse(student),
+      student: toStudentResponse(student, library),
       seat: seat ? { id: seat._id.toString(), number: seat.number } : null,
       attendance: {
         date: todayKey,
@@ -141,7 +150,8 @@ router.post("/me/photo", requireAuth, requireRole("student"), upload.single("pho
     student.photoUrl = url;
     await student.save();
 
-    return res.json({ ok: true, student: toStudentResponse(student) });
+    const library = await Library.findById(libraryId).select("name logoUrl").lean();
+    return res.json({ ok: true, student: toStudentResponse(student, library) });
   } catch (error) {
     return res.status(500).json({ message: "Photo upload failed", error: error.message });
   }

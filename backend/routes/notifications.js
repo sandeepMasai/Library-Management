@@ -3,6 +3,7 @@ const Notification = require("../models/Notification");
 const mongoose = require("mongoose");
 const { requireAuth } = require("../src/middleware/auth.middleware");
 const { requireRole } = require("../src/middleware/role.middleware");
+const { requireNotExpiredSubscription } = require("../src/middleware/subscription.middleware");
 
 const router = express.Router();
 
@@ -101,6 +102,15 @@ router.post("/", requireAuth, requireRole("admin", "library"), async (req, res) 
     // Multi-tenant security enforced
     const libraryId = requireLibraryIdForAdmin(req, res);
     if (!libraryId) return;
+
+    if (req.user?.role === "library") {
+      // Block announcements when subscription is expired.
+      await new Promise((resolve, reject) =>
+        requireNotExpiredSubscription(req, res, (err) => (err ? reject(err) : resolve()))
+      );
+      // If middleware responded with 402 it will have ended the response.
+      if (res.headersSent) return;
+    }
 
     const created = await Notification.create({
       libraryId,

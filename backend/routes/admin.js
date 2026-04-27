@@ -7,10 +7,18 @@ const Notification = require("../models/Notification");
 const AttendanceQr = require("../models/AttendanceQr");
 const Seat = require("../models/Seat");
 const Log = require("../models/Log");
+const Subscription = require("../models/Subscription");
+const Payment = require("../models/Payment");
+const PlanConfig = require("../models/PlanConfig");
+const { ensurePlanConfigSeeded, DEFAULT_PLANS } = require("../src/utils/paymentPlans");
 const { requireAuth } = require("../src/middleware/auth.middleware");
 const { requireRole } = require("../src/middleware/role.middleware");
 
 const router = express.Router();
+
+function escapeRegex(str) {
+  return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function toLibraryRow(lib) {
   return {
@@ -19,6 +27,10 @@ function toLibraryRow(lib) {
     ownerName: lib.ownerName,
     email: lib.email,
     plan: lib.plan,
+    subscriptionStatus: lib.subscriptionStatus || "active",
+    cancelledAt: lib.cancelledAt?.toISOString?.() || null,
+    cancelReason: lib.cancelReason || null,
+    cancelNote: lib.cancelNote || null,
     status: lib.isActive ? "active" : "blocked",
     isActive: Boolean(lib.isActive),
     libraryCode: lib.libraryCode,
@@ -71,22 +83,94 @@ router.get("/dashboard", requireAuth, requireRole("admin"), async (req, res) => 
 });
 
 /**
+ * GET /api/admin/payment-plans
+ *
+ * Returns current plan pricing (admin-manageable).
+ */
+router.get("/payment-plans", requireAuth, requireRole("admin"), async (_req, res) => {
+  try {
+    await ensurePlanConfigSeeded();
+    const rows = await PlanConfig.find({ key: { $in: Object.keys(DEFAULT_PLANS) } })
+      .select("key title price durationDays active updatedAt")
+      .sort({ key: 1 })
+      .lean();
+    return res.json({ ok: true, plans: rows });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to load payment plans", error: error.message });
+  }
+});
+
+/**
+ * PUT /api/admin/payment-plans/:key
+ *
+ * Body:
+ * - price: number (INR)
+ * - durationDays: number
+ * - title?: string
+ * - active?: boolean
+ */
+router.put("/payment-plans/:key", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const key = String(req.params.key || "").trim().toLowerCase();
+    if (!DEFAULT_PLANS[key]) return res.status(400).json({ message: "Invalid plan key" });
+
+    const price = Number(req.body?.price);
+    const durationDays = Number(req.body?.durationDays);
+    const title = req.body?.title === undefined ? undefined : String(req.body?.title || "").trim();
+    const active = req.body?.active === undefined ? undefined : Boolean(req.body?.active);
+
+    if (!Number.isFinite(price) || price < 0) return res.status(400).json({ message: "Invalid price" });
+    if (!Number.isFinite(durationDays) || durationDays < 1) return res.status(400).json({ message: "Invalid durationDays" });
+
+    await ensurePlanConfigSeeded();
+    const next = await PlanConfig.findOneAndUpdate(
+      { key },
+      {
+        $set: {
+          ...(title !== undefined ? { title } : {}),
+          price,
+          durationDays,
+          ...(active !== undefined ? { active } : {}),
+        },
+      },
+      { new: true, upsert: true }
+    )
+      .select("key title price durationDays active updatedAt")
+      .lean();
+
+    return res.json({ ok: true, plan: next });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to update payment plan", error: error.message });
+  }
+});
+
+/**
  * GET /api/admin/libraries
  *
  * List libraries for admin table.
  */
 router.get("/libraries", requireAuth, requireRole("admin"), async (req, res) => {
   try {
+    const searchRaw = String(req.query.search || "").trim();
+    const search = searchRaw.trim();
+    const searchUpper = search.toUpperCase();
+    const isCodeSearch = Boolean(search) && /^[A-Z0-9]{5,12}$/.test(searchUpper);
+    const filter = !search
+      ? {}
+      : isCodeSearch
+        ? { libraryCode: searchUpper }
+        : { $or: [{ name: { $regex: escapeRegex(search), $options: "i" } }, { ownerName: { $regex: escapeRegex(search), $options: "i" } }] };
+
     const includeCounts =
       String(req.query.includeCounts || "").trim() === "1" ||
       String(req.query.includeCounts || "").trim().toLowerCase() === "true";
     const { page, limit, skip } = parsePagination(req);
-    const totalPromise = Library.countDocuments({});
+    const totalPromise = Library.countDocuments(filter);
 
     if (!includeCounts) {
       const [total, list] = await Promise.all([
         totalPromise,
-        Library.find({})
+        Library.find(filter)
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit)
@@ -98,6 +182,7 @@ router.get("/libraries", requireAuth, requireRole("admin"), async (req, res) => 
     const [total, rows] = await Promise.all([
       totalPromise,
       Library.aggregate([
+        { $match: filter },
         { $sort: { createdAt: -1 } },
         { $skip: skip },
         { $limit: limit },
@@ -174,6 +259,213 @@ router.get("/students", requireAuth, requireRole("admin"), async (req, res) => {
     return res.json({ ok: true, students, page, limit, total });
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch students", error: error.message });
+  }
+});
+
+/**
+ * GET /api/admin/library/:id
+ *
+ * Library detail page:
+ * - full library profile fields
+ * - stats: seats, total students, active students, revenue
+ * - subscription info + cancellation reason
+ */
+router.get("/library/:id", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid library id" });
+
+    const lib = await Library.findById(id).lean();
+    if (!lib) return res.status(404).json({ message: "Library not found" });
+
+    const libraryId = lib._id;
+    const now = new Date();
+
+    const [totalSeats, totalStudents, activeStudents, revenueAgg] = await Promise.all([
+      Seat.countDocuments({ libraryId }),
+      Student.countDocuments({ libraryId, isDeleted: false }),
+      Student.countDocuments({
+        libraryId,
+        isDeleted: false,
+        isBlocked: false,
+        expiryDate: { $gte: now },
+      }),
+      Student.aggregate([
+        { $match: { libraryId, isDeleted: false, feeStatus: "Paid" } },
+        { $group: { _id: null, revenue: { $sum: "$feeAmount" } } },
+      ]),
+    ]);
+
+    const revenue = Number(revenueAgg?.[0]?.revenue || 0);
+
+    return res.json({
+      ok: true,
+      library: {
+        id: lib._id.toString(),
+        name: lib.name,
+        libraryCode: lib.libraryCode,
+        ownerName: lib.ownerName,
+        email: lib.email,
+        phone: lib.phone || null,
+        address: lib.address || null,
+        city: lib.city,
+        isActive: Boolean(lib.isActive),
+        plan: lib.plan,
+        planStartDate: lib.planStartDate?.toISOString?.() || null,
+        planExpiryDate: lib.planExpiryDate?.toISOString?.() || null,
+        subscriptionStatus: lib.subscriptionStatus || "active",
+        cancelledAt: lib.cancelledAt?.toISOString?.() || null,
+        cancelReason: lib.cancelReason || null,
+        cancelNote: lib.cancelNote || null,
+        createdAt: lib.createdAt?.toISOString?.() || null,
+      },
+      stats: {
+        totalSeats,
+        totalStudents,
+        activeStudents,
+        revenue,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to load library detail", error: error.message });
+  }
+});
+
+/**
+ * GET /api/admin/library/:id/subscription
+ *
+ * Subscription detail card for a single library:
+ * - library info + owner info
+ * - subscription (latest row) with computed status (active/expired/cancelled)
+ * - stats (seats/students/active/revenue)
+ */
+router.get("/library/:id/subscription", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid library id" });
+
+    const lib = await Library.findById(id)
+      .select("name libraryCode ownerName phone email plan planStartDate planExpiryDate subscriptionStatus cancelledAt cancelReason cancelNote isActive")
+      .lean();
+    if (!lib) return res.status(404).json({ message: "Library not found" });
+
+    const libraryId = lib._id;
+    const now = new Date();
+
+    const latestSub = await Subscription.findOne({ libraryId }).sort({ createdAt: -1 }).lean();
+
+    const plan = latestSub?.plan || (lib.plan === "pro" ? "monthly" : "free");
+    const price = typeof latestSub?.price === "number" ? latestSub.price : lib.plan === "pro" ? 999 : 0;
+    const startDate = (latestSub?.startDate || lib.planStartDate)?.toISOString?.() || null;
+    const expiryDate = (latestSub?.expiryDate || lib.planExpiryDate)?.toISOString?.() || null;
+
+    const endMs = latestSub?.expiryDate
+      ? new Date(latestSub.expiryDate).getTime()
+      : lib.planExpiryDate
+        ? new Date(lib.planExpiryDate).getTime()
+        : null;
+
+    const isCancelled = (latestSub?.status === "cancelled") || lib.subscriptionStatus === "cancelled";
+    const calcStatus = isCancelled ? "cancelled" : endMs && Number.isFinite(endMs) && endMs < now.getTime() ? "expired" : "active";
+
+    const pay = latestSub?.paymentStatus || (plan === "free" ? "paid" : "paid");
+
+    const [totalSeats, totalStudents, activeStudents, revenueAgg, recentPayments] = await Promise.all([
+      Seat.countDocuments({ libraryId }),
+      Student.countDocuments({ libraryId, isDeleted: false }),
+      Student.countDocuments({
+        libraryId,
+        isDeleted: false,
+        isBlocked: false,
+        expiryDate: { $gte: now },
+      }),
+      Student.aggregate([
+        { $match: { libraryId, isDeleted: false, feeStatus: "Paid" } },
+        { $group: { _id: null, revenue: { $sum: "$feeAmount" } } },
+      ]),
+      Payment.find({ libraryId })
+        .sort({ createdAt: -1 })
+        .limit(8)
+        .select("plan amount currency status orderId paymentId createdAt")
+        .lean(),
+    ]);
+
+    const revenue = Number(revenueAgg?.[0]?.revenue || 0);
+
+    return res.json({
+      ok: true,
+      libraryName: lib.name,
+      libraryCode: lib.libraryCode,
+      isActive: Boolean(lib.isActive),
+      libraryPlan: lib.plan, // free | pro (library-level)
+      owner: {
+        name: lib.ownerName,
+        phone: lib.phone || null,
+        email: lib.email,
+      },
+      subscription: {
+        plan,
+        price,
+        startDate,
+        expiryDate,
+        status: calcStatus,
+        paymentStatus: pay,
+      },
+      stats: {
+        totalSeats,
+        totalStudents,
+        activeStudents,
+        revenue,
+      },
+      payments: (recentPayments || []).map((p) => ({
+        id: String(p._id),
+        plan: p.plan,
+        amount: Number(p.amount || 0),
+        currency: p.currency || "INR",
+        status: p.status || "paid",
+        orderId: p.orderId,
+        paymentId: p.paymentId,
+        date: p.createdAt?.toISOString?.() || null,
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to load subscription detail", error: error.message });
+  }
+});
+
+/**
+ * POST /api/admin/subscription/cancel
+ *
+ * Admin action: mark library subscription as cancelled (keeps access until expiry).
+ * Body: { libraryId }
+ */
+router.post("/subscription/cancel", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const libraryIdRaw = String(req.body?.libraryId || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(libraryIdRaw)) return res.status(400).json({ message: "Invalid libraryId" });
+
+    const lib = await Library.findById(libraryIdRaw);
+    if (!lib) return res.status(404).json({ message: "Library not found" });
+
+    if (!lib.planExpiryDate) {
+      return res.status(400).json({ message: "No active expiring plan to cancel" });
+    }
+
+    if (lib.subscriptionStatus !== "cancelled") {
+      lib.subscriptionStatus = "cancelled";
+      lib.cancelledAt = new Date();
+      await lib.save();
+    }
+
+    await Subscription.updateOne(
+      { libraryId: lib._id, status: "active" },
+      { $set: { status: "cancelled", cancelledAt: lib.cancelledAt || new Date() } },
+      { sort: { createdAt: -1 } }
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to cancel subscription", error: error.message });
   }
 });
 
@@ -319,38 +611,104 @@ router.get("/analytics/revenue", requireAuth, requireRole("admin"), async (req, 
  */
 router.get("/subscriptions", requireAuth, requireRole("admin"), async (req, res) => {
   try {
-    const status = String(req.query.status || "all").trim().toLowerCase();
+    const status = String(req.query.status || "all").trim().toLowerCase(); // all|active|expired|cancelled
+    const paymentStatus = String(req.query.paymentStatus || "all").trim().toLowerCase(); // all|paid|pending
+    const searchRaw = String(req.query.search || "").trim();
+    const search = searchRaw.trim();
+    const searchUpper = search.toUpperCase();
+    const isCodeSearch = Boolean(search) && /^[A-Z0-9]{5,12}$/.test(searchUpper);
     const now = new Date();
 
-    // Auto-enforce expiry: downgrade expired paid plans to free (limited).
-    // (Keeps data consistent without relying on a cron job.)
-    await Library.updateMany(
-      { planExpiryDate: { $ne: null, $lt: now }, plan: "pro" },
-      { $set: { plan: "free", planStartDate: now, planExpiryDate: null } }
-    );
+    // New source of truth: Subscription collection (latest row per library).
+    // Backward compatibility: if a library has no Subscription row yet, we fall back to Library plan fields.
 
-    const match =
-      status === "active"
-        ? { $or: [{ planExpiryDate: null }, { planExpiryDate: { $gte: now } }] }
-        : status === "expired"
-          ? { planExpiryDate: { $ne: null, $lt: now } }
-          : {};
+    const searchMatch = !search
+      ? {}
+      : isCodeSearch
+        ? { libraryCode: searchUpper }
+        : { $or: [{ name: { $regex: escapeRegex(search), $options: "i" } }, { ownerName: { $regex: escapeRegex(search), $options: "i" } }] };
 
-    const list = await Library.find(match)
-      .sort({ planExpiryDate: 1 })
-      .select("name ownerName email plan planExpiryDate isActive")
-      .lean();
+    function fallbackPlanMeta(lib) {
+      if (lib.plan !== "pro") return { plan: "free", price: 0 };
+      const start = lib.planStartDate ? new Date(lib.planStartDate).getTime() : null;
+      const end = lib.planExpiryDate ? new Date(lib.planExpiryDate).getTime() : null;
+      const days =
+        start && end && Number.isFinite(start) && Number.isFinite(end)
+          ? Math.round((end - start) / (24 * 60 * 60 * 1000))
+          : null;
+      if (days === 30) return { plan: "monthly", price: 999 };
+      if (days === 180) return { plan: "6month", price: 4999 };
+      if (days === 365) return { plan: "yearly", price: 10000 };
+      return { plan: "monthly", price: 999 };
+    }
 
-    const rows = list.map((lib) => ({
-      id: lib._id.toString(),
-      name: lib.name,
-      ownerName: lib.ownerName,
-      email: lib.email,
-      plan: lib.plan,
-      expiryDate: lib.planExpiryDate?.toISOString?.() || null,
-      status: lib.planExpiryDate && new Date(lib.planExpiryDate).getTime() < now.getTime() ? "expired" : "active",
-      isActive: Boolean(lib.isActive),
-    }));
+    const list = await Library.aggregate([
+      { $match: searchMatch },
+      {
+        $lookup: {
+          from: Subscription.collection.name,
+          let: { libraryId: "$_id" },
+          pipeline: [
+            { $match: { $expr: { $eq: ["$libraryId", "$$libraryId"] } } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 1 },
+          ],
+          as: "sub",
+        },
+      },
+      { $addFields: { sub: { $arrayElemAt: ["$sub", 0] } } },
+      { $sort: { planExpiryDate: 1, createdAt: -1 } },
+      {
+        $project: {
+          name: 1,
+          ownerName: 1,
+          email: 1,
+          plan: 1,
+          planStartDate: 1,
+          planExpiryDate: 1,
+          subscriptionStatus: 1,
+          cancelledAt: 1,
+          libraryCode: 1,
+          isActive: 1,
+          sub: 1,
+        },
+      },
+    ]);
+
+    const rows = list
+      .map((lib) => {
+        const sub = lib.sub || null;
+
+        const plan = sub?.plan || fallbackPlanMeta(lib).plan;
+        const price = typeof sub?.price === "number" ? sub.price : fallbackPlanMeta(lib).price;
+        const startDate = (sub?.startDate || lib.planStartDate)?.toISOString?.() || null;
+        const expiryDate = (sub?.expiryDate || lib.planExpiryDate)?.toISOString?.() || null;
+        const endMs = sub?.expiryDate ? new Date(sub.expiryDate).getTime() : lib.planExpiryDate ? new Date(lib.planExpiryDate).getTime() : null;
+
+        const isCancelled = (sub?.status === "cancelled") || lib.subscriptionStatus === "cancelled";
+        const calcStatus = isCancelled ? "cancelled" : endMs && Number.isFinite(endMs) && endMs < now.getTime() ? "expired" : "active";
+
+        const pay = sub?.paymentStatus || (plan === "free" ? "paid" : "paid");
+
+        return {
+          id: (sub?._id || lib._id).toString(),
+          libraryId: lib._id.toString(),
+          libraryName: lib.name,
+          libraryCode: lib.libraryCode,
+          ownerName: lib.ownerName,
+          email: lib.email,
+          plan,
+          price,
+          startDate,
+          expiryDate,
+          status: calcStatus,
+          paymentStatus: pay,
+          cancelledAt: (sub?.cancelledAt || lib.cancelledAt)?.toISOString?.() || null,
+          isActive: Boolean(lib.isActive),
+        };
+      })
+      .filter((r) => (status === "all" ? true : r.status === status))
+      .filter((r) => (paymentStatus === "all" ? true : r.paymentStatus === paymentStatus));
 
     return res.json({ ok: true, rows });
   } catch (error) {

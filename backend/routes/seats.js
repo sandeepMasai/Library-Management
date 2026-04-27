@@ -23,6 +23,7 @@ function toResponse(seat) {
     id: seat._id.toString(),
     libraryId: seat.libraryId?.toString?.() || null,
     number: seat.number,
+    spaceId: seat.spaceId ? seat.spaceId.toString() : null,
     status: seat.status,
     studentId: seat.studentId ? seat.studentId.toString() : null,
   };
@@ -44,17 +45,73 @@ router.post("/", requireAuth, requireRole("library"), async (req, res) => {
   try {
     const libraryId = req.user.libraryId;
     const number = Number(req.body?.number);
+    const spaceId = req.body?.spaceId ? String(req.body.spaceId).trim() : null;
     if (!Number.isInteger(number) || number < 1) {
       return res.status(400).json({ message: "number must be a positive integer" });
     }
+    if (spaceId && !mongoose.Types.ObjectId.isValid(spaceId)) {
+      return res.status(400).json({ message: "Invalid spaceId" });
+    }
     // Multi-tenant security enforced
-    const created = await Seat.create({ libraryId, number, status: "available", studentId: null });
+    const created = await Seat.create({ libraryId, number, spaceId: spaceId || null, status: "available", studentId: null });
     return res.status(201).json(toResponse(created));
   } catch (error) {
     if (error?.code === 11000) {
       return res.status(409).json({ message: "Seat number already exists" });
     }
     return res.status(500).json({ message: "Failed to create seat", error: error.message });
+  }
+});
+
+/**
+ * POST /api/seats/bulk-create
+ * Body: { totalSeats: number, spaceId?: string|null }
+ *
+ * Idempotent: creates missing seats from 1..N.
+ */
+router.post("/bulk-create", requireAuth, requireRole("library"), async (req, res) => {
+  try {
+    const libraryId = req.user.libraryId;
+    const totalSeats = Number(req.body?.totalSeats);
+    const spaceId = req.body?.spaceId ? String(req.body.spaceId).trim() : null;
+    if (!Number.isInteger(totalSeats) || totalSeats < 1 || totalSeats > 5000) {
+      return res.status(400).json({ message: "totalSeats must be an integer between 1 and 5000" });
+    }
+    if (spaceId && !mongoose.Types.ObjectId.isValid(spaceId)) {
+      return res.status(400).json({ message: "Invalid spaceId" });
+    }
+
+    const existing = await Seat.find({ libraryId, number: { $gte: 1, $lte: totalSeats } }, { number: 1 }).lean();
+    const existsSet = new Set(existing.map((s) => s.number));
+    const docs = [];
+    for (let n = 1; n <= totalSeats; n++) {
+      if (!existsSet.has(n)) docs.push({ libraryId, number: n, spaceId: spaceId || null, status: "available", studentId: null });
+    }
+    if (docs.length) await Seat.insertMany(docs, { ordered: false });
+    const list = await Seat.find({ libraryId }).sort({ number: 1 }).lean();
+    return res.json(list.map(toResponse));
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to bulk create seats", error: error.message });
+  }
+});
+
+/**
+ * PATCH /api/seats/:id
+ * Body: { spaceId: string|null }
+ */
+router.patch("/:id", requireAuth, requireRole("library"), async (req, res) => {
+  try {
+    const libraryId = req.user.libraryId;
+    const seatId = String(req.params.id || "").trim();
+    const spaceId = req.body?.spaceId === null || req.body?.spaceId === "" ? null : String(req.body?.spaceId || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(seatId)) return res.status(400).json({ message: "Invalid seatId" });
+    if (spaceId && !mongoose.Types.ObjectId.isValid(spaceId)) return res.status(400).json({ message: "Invalid spaceId" });
+
+    const updated = await Seat.findOneAndUpdate({ _id: seatId, libraryId }, { spaceId: spaceId || null }, { new: true });
+    if (!updated) return res.status(404).json({ message: "Seat not found" });
+    return res.json(toResponse(updated));
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to update seat", error: error.message });
   }
 });
 

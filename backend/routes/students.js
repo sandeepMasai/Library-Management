@@ -6,6 +6,7 @@ const bcrypt = require("bcryptjs");
 const mongoose = require("mongoose");
 const { requireAuth } = require("../src/middleware/auth.middleware");
 const { requireRole } = require("../src/middleware/role.middleware");
+const { requireNotExpiredSubscription } = require("../src/middleware/subscription.middleware");
 const { writeLog } = require("../src/utils/logging");
 
 const router = express.Router();
@@ -87,6 +88,9 @@ router.get("/", requireAuth, requireRole("admin", "library"), async (req, res) =
     res.status(500).json({ message: "Failed to fetch students", error: error.message });
   }
 });
+
+// Block student mutations if library subscription expired.
+router.use(requireAuth, requireRole("library"), requireNotExpiredSubscription);
 
 router.post("/", requireAuth, requireRole("library"), async (req, res) => {
   try {

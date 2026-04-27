@@ -14,6 +14,12 @@ const subscriptionRoutes = require("../routes/subscription");
 const libraryRoutes = require("../routes/library");
 const userRoutes = require("../routes/user");
 const templateRoutes = require("../routes/templates");
+const spaceRoutes = require("../routes/spaces");
+const shiftRoutes = require("../routes/shifts");
+const allocationRoutes = require("../routes/allocations");
+const paymentRoutes = require("../routes/payment");
+const planRoutes = require("../routes/plans");
+const settingsRoutes = require("../routes/settings");
 const { getMongoStatus } = require("./config/db");
 const { errorHandler } = require("./middleware/error.middleware");
 
@@ -35,6 +41,12 @@ app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/library", libraryRoutes);
 app.use("/api/user", userRoutes);
 app.use("/api/templates", templateRoutes);
+app.use("/api/spaces", spaceRoutes);
+app.use("/api/shifts", shiftRoutes);
+app.use("/api/allocations", allocationRoutes);
+app.use("/api/payment", paymentRoutes);
+app.use("/api/plans", planRoutes);
+app.use("/api/settings", settingsRoutes);
 
 app.get("/health", (_req, res) => {
   res.json({
