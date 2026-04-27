@@ -15,6 +15,7 @@
 
 ## Expo / React Native
 frontend/.expo/
+frontend/.gradle-user-home/
 frontend/android/.gradle-user-home/
 frontend/android/.gradle/
 frontend/android/build/
